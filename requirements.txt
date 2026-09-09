@@ -1,2 +1,6 @@
 streamlit
 edge-tts
+pypdf
+EbookLib
+python-docx
+beautifulsoup4
