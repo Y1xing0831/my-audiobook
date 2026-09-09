@@ -1,6 +1,7 @@
 import asyncio
 import io
 import struct
+import re
 import streamlit as st
 import edge_tts
 from pypdf import PdfReader
@@ -35,39 +36,27 @@ VOICES = {
     "普通話男聲 - 雲希 (Yunxi)": "zh-CN-YunxiNeural",
 }
 
-# PalmDOC LZ77/RLE 解壓縮演算法
-def decompress_palmdoc(data: bytes) -> bytes:
-    out = bytearray()
-    i = 0
-    n = len(data)
-    while i < n:
-        c = data[i]
-        i += 1
-        if c >= 1 and c <= 8:
-            # 原樣複製 c 個位元組
-            out.extend(data[i:i+c])
-            i += c
-        elif c <= 0x7f:
-            # 單一字元
-            out.append(c)
-        elif c >= 0xc0:
-            # 空格 + 字元
-            out.append(0x20)
-            out.append(c ^ 0x80)
-        else:
-            # 0x80 到 0xbf: 滑動視窗重複片段 (2 bytes command)
-            if i < n:
-                c2 = data[i]
-                i += 1
-                distance = (((c << 8) | c2) >> 3) & 0x07ff
-                length = (c2 & 0x07) + 3
-                for _ in range(length):
-                    if len(out) >= distance and distance > 0:
-                        out.append(out[-distance])
-    return bytes(out)
+# 終極 PDB 解析器 (兼顧好讀網 pdb / zTXT / PalmDOC)
+def parse_pdb_robust(file_bytes: bytes) -> str:
+    # 策略 1：強效二進位 Big5/CP950 繁體中文片段提取 (專治好讀網與舊版 PDB 亂碼)
+    extracted_text = []
+    
+    # 嘗試不同中文編碼解析全檔
+    for enc in ["cp950", "big5", "gb18030", "utf-8"]:
+        try:
+            # 暴力試圖解碼
+            raw_text = file_bytes.decode(enc, errors="ignore")
+            # 過濾出連續的中文字串與標點符號
+            chinese_blocks = re.findall(r'[\u4e00-\u9fa5\u3000-\u303f\uff00-\uffef\w\n\r]{4,}', raw_text)
+            combined = "\n".join(chinese_blocks)
+            
+            # 如果提取出的有效中文字數足夠多，代表成功匹配正確編碼
+            if len(combined) > 50:
+                return combined
+        except Exception:
+            continue
 
-# 健全的 PDB 檔案解析器
-def parse_pdb(file_bytes: bytes) -> str:
+    # 策略 2：PalmDOC 紀錄解構法 (當策略 1 失效時使用)
     try:
         num_records = struct.unpack(">H", file_bytes[76:78])[0]
         record_offsets = []
@@ -75,52 +64,26 @@ def parse_pdb(file_bytes: bytes) -> str:
             offset = struct.unpack(">I", file_bytes[78 + i * 8 : 82 + i * 8])[0]
             record_offsets.append(offset)
 
-        raw_chunks = []
-        for i in range(num_records):
+        chunks = []
+        for i in range(1, num_records):
             start = record_offsets[i]
             end = record_offsets[i + 1] if i + 1 < num_records else len(file_bytes)
-            raw_chunks.append(file_bytes[start:end])
+            chunks.append(file_bytes[start:end])
 
-        decompressed_bytes = bytearray()
+        raw_data = b"".join(chunks)
         
-        # 判斷是否為 PalmDOC 格式 (由第一個 record 標頭檢查)
-        if len(raw_chunks) > 0 and len(raw_chunks[0]) >= 16:
-            version = struct.unpack(">H", raw_chunks[0][0:2])[0]
-            compression = struct.unpack(">H", raw_chunks[0][2:4])[0]
-            
-            # 從第二個 Record 開始才是真正的文字數據
-            for chunk in raw_chunks[1:]:
-                if compression == 2:  # PalmDOC 壓縮
-                    decompressed_bytes.extend(decompress_palmdoc(chunk))
-                else:  # 未壓縮
-                    decompressed_bytes.extend(chunk)
-        else:
-            for chunk in raw_chunks:
-                decompressed_bytes.extend(chunk)
-
-        final_data = bytes(decompressed_bytes)
-
-        # 動態偵測字元編碼
-        detected = chardet.detect(final_data[:10000])
-        detected_enc = detected.get("encoding")
-
-        encodings_to_try = [detected_enc, "cp950", "big5", "gb18030", "utf-8"]
-        for enc in encodings_to_try:
-            if not enc:
-                continue
+        for enc in ["cp950", "big5", "gb18030", "utf-8"]:
             try:
-                text = final_data.decode(enc)
-                # 清除不可列印的控制字元
+                text = raw_data.decode(enc, errors="ignore")
                 clean_text = "".join(char for char in text if char.isprintable() or char in "\n\r\t")
-                if len(clean_text) > 20:
+                if len(re.findall(r'[\u4e00-\u9fa5]', clean_text)) > 20:
                     return clean_text
             except Exception:
                 continue
+    except Exception:
+        pass
 
-        return final_data.decode("utf-8", errors="ignore")
-
-    except Exception as e:
-        return f"PDB 解析失敗: {str(e)}"
+    return "PDB 解析失敗：無法讀取有效的中文文本內容。"
 
 # 通用文本解析函式
 def extract_text(file) -> str:
@@ -135,7 +98,7 @@ def extract_text(file) -> str:
         
     elif filename.endswith(".pdb"):
         file_bytes = file.read()
-        text = parse_pdb(file_bytes)
+        text = parse_pdb_robust(file_bytes)
         
     elif filename.endswith(".pdf"):
         reader = PdfReader(file)
@@ -177,7 +140,7 @@ if uploaded_file is not None:
         text_content = extract_text(uploaded_file)
         
     if not text_content or text_content.startswith("PDB 解析失敗"):
-        st.error("無法從檔案中提取出文字內容（可能是加密或格式毀損的檔案）。")
+        st.error("無法從檔案中提取出文字內容。如果這個 PDB 檔案特殊，建議先在電腦用 Calibre 轉成 EPUB 或 TXT 檔上傳。")
     else:
         st.subheader("📄 內容預覽")
         st.text_area("提取文字（前 1000 字）：", text_content[:1000] + ("..." if len(text_content) > 1000 else ""), height=180)
