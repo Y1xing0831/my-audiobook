@@ -1,8 +1,7 @@
 import asyncio
-import io
+import base64
 import os
 import re
-import struct
 import tempfile
 import streamlit as st
 import edge_tts
@@ -14,35 +13,7 @@ from bs4 import BeautifulSoup
 import chardet
 import mobi
 
-# 1. 頁面佈局與 Speechify 風格 CSS 注入
-st.set_page_config(page_title="Speechify AI 閱讀器", page_icon="🎧", layout="wide")
-
-st.markdown(
-    """
-    <head>
-        <link rel="apple-touch-icon" sizes="180x180" href="/app/static/apple-touch-icon.png">
-        <link rel="apple-touch-icon-precomposed" href="/app/static/apple-touch-icon.png">
-    </head>
-    <style>
-    .highlight-box {
-        background-color: #f0f7ff;
-        border-left: 6px solid #0066cc;
-        padding: 20px;
-        font-size: 20px;
-        line-height: 1.8;
-        border-radius: 8px;
-        margin-top: 15px;
-        margin-bottom: 20px;
-        color: #1a1a1a;
-        box-shadow: 0 2px 8px rgba(0,0,0,0.05);
-    }
-    .stAudio { margin-top: 10px; }
-    </style>
-    """,
-    unsafe_allow_html=True
-)
-
-st.title("🎧 AI 邊聽邊讀閱讀器 (Speechify Style)")
+st.set_page_config(page_title="Speechify AI Web Reader", page_icon="🎧", layout="wide")
 
 # 聲線清單
 VOICES = {
@@ -53,7 +24,7 @@ VOICES = {
     "普通話男聲 - 雲希": "zh-CN-YunxiNeural",
 }
 
-# 1. 強效 PDB 解析器
+# --- 解析器模組 ---
 def parse_pdb_robust(file_bytes: bytes) -> str:
     for enc in ["cp950", "big5", "gb18030", "utf-8"]:
         try:
@@ -64,19 +35,15 @@ def parse_pdb_robust(file_bytes: bytes) -> str:
                 return combined
         except Exception:
             continue
-    return "PDB 解析失敗：無法讀取有效的中文文字內容。"
+    return "PDB 解析失敗"
 
-# 2. MOBI 解析器
 def parse_mobi(file_bytes: bytes) -> str:
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".mobi") as tmp_in:
             tmp_in.write(file_bytes)
             tmp_in_path = tmp_in.name
-
         tempdir, filepath = mobi.extract(tmp_in_path)
         text = ""
-        
-        # 讀取拆解出來的 html/htmlx/txt 內容
         if os.path.exists(filepath):
             with open(filepath, 'rb') as f:
                 raw = f.read()
@@ -84,136 +51,258 @@ def parse_mobi(file_bytes: bytes) -> str:
                 enc = detected.get("encoding") or "utf-8"
                 soup = BeautifulSoup(raw.decode(enc, errors="ignore"), "html.parser")
                 text = soup.get_text()
-
-        # 清理暫存檔
         os.remove(tmp_in_path)
         return text
     except Exception as e:
         return f"MOBI 解析失敗: {str(e)}"
 
-# 3. 全格式通用文字提取
 def extract_text(file) -> str:
     filename = file.name.lower()
     text = ""
-    
     if filename.endswith(".txt"):
         raw = file.read()
         detected = chardet.detect(raw[:5000])
         enc = detected.get("encoding") or "utf-8"
         text = raw.decode(enc, errors="ignore")
-        
     elif filename.endswith(".pdb"):
-        file_bytes = file.read()
-        text = parse_pdb_robust(file_bytes)
-
+        text = parse_pdb_robust(file.read())
     elif filename.endswith(".mobi"):
-        file_bytes = file.read()
-        text = parse_mobi(file_bytes)
-        
+        text = parse_mobi(file.read())
     elif filename.endswith(".pdf"):
         reader = PdfReader(file)
         for page in reader.pages:
             page_text = page.extract_text()
             if page_text:
                 text += page_text + "\n"
-                
     elif filename.endswith(".docx"):
         doc = docx.Document(file)
         text = "\n".join([p.text for p in doc.paragraphs if p.text])
-        
     elif filename.endswith(".epub"):
         book = epub.read_epub(file)
         for item in book.get_items_of_type(ebooklib.ITEM_DOCUMENT):
             soup = BeautifulSoup(item.get_body_content(), "html.parser")
             text += soup.get_text() + "\n"
-            
     return text.strip()
 
-# 4. 長文章切分為小段落 (極速預載關鍵)
-def split_text_into_chunks(text, max_chars=350):
-    sentences = re.split(r'(?<=[。！？\n])', text)
-    chunks = []
-    current_chunk = ""
-    for s in sentences:
-        if len(current_chunk) + len(s) <= max_chars:
-            current_chunk += s
-        else:
-            if current_chunk.strip():
-                chunks.append(current_chunk.strip())
-            current_chunk = s
-    if current_chunk.strip():
-        chunks.append(current_chunk.strip())
-    return chunks
+# 將文章切分為句子（Speechify 逐句流式高亮的核心基礎）
+def split_into_sentences(text):
+    sentences = re.split(r'(?<=[。！？；!?;\n])', text)
+    cleaned = [s.strip() for s in sentences if s.strip()]
+    return cleaned
 
-# 5. 極速語音合成 (支援語速控制)
-async def tts_fast(text, voice_code, rate_str):
+async def generate_sentence_audio(text, voice_code, rate_str):
     communicate = edge_tts.Communicate(text, voice_code, rate=rate_str)
     audio_data = b""
     async for chunk in communicate.stream():
         if chunk["type"] == "audio":
             audio_data += chunk["data"]
-    return audio_data
+    return base64.b64encode(audio_data).decode("utf-8")
 
-# 側邊欄：控制中心
-with st.sidebar:
-    st.header("⚙️ 播放控制中心")
-    selected_voice = st.selectbox("朗讀聲線", list(VOICES.keys()))
+# --- UI 樣式注入 ---
+st.markdown("""
+<style>
+    /* 全頁 Speechify 乾淨風格 */
+    .main { background-color: #fcfcfc; }
     
-    speed = st.slider("朗讀速度 (Speed)", min_value=0.8, max_value=2.0, value=1.2, step=0.1)
+    /* 閱讀器容器 */
+    .speechify-container {
+        max-width: 800px;
+        margin: 0 auto;
+        padding: 40px 20px 120px 20px;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+        font-size: 22px;
+        line-height: 2.0;
+        color: #2c3e50;
+    }
+
+    /* 句子節點 */
+    .sentence {
+        padding: 3px 6px;
+        margin: 0 2px;
+        border-radius: 6px;
+        cursor: pointer;
+        transition: all 0.2s ease;
+        display: inline;
+    }
+
+    .sentence:hover {
+        background-color: #e8f4ff;
+        color: #0066cc;
+    }
+
+    /* 當前播放高亮 (Speechify 經典黃藍配色) */
+    .sentence.active {
+        background-color: #ffe885 !important;
+        color: #000000 !important;
+        font-weight: 600;
+        box-shadow: 0 2px 8px rgba(255, 200, 0, 0.4);
+    }
+
+    /* 頂部導覽列 */
+    .speechify-header {
+        text-align: center;
+        padding: 20px 0;
+        border-bottom: 1px solid #eee;
+        margin-bottom: 30px;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# 側邊欄控制
+with st.sidebar:
+    st.title("🎧 Speechify 設定")
+    selected_voice = st.selectbox("朗讀聲音", list(VOICES.keys()))
+    speed = st.slider("朗讀速度 (Speed)", min_value=0.8, max_value=2.5, value=1.2, step=0.1)
     speed_percent = f"{int((speed - 1.0) * 100):+d}%"
-    st.caption(f"當前語速加碼：**{speed_percent}**")
+    st.info(f"⚡ 當前語速設定：**{speed}x**")
 
-# 檔案上傳 (加入 mobi 支援)
-uploaded_file = st.file_uploader(
-    "上傳書籍檔案 (支援 .txt, .pdb, .mobi, .epub, .pdf, .docx)", 
-    type=["txt", "pdb", "mobi", "epub", "pdf", "docx"]
-)
+st.title("📖 Speechify 互動閱讀器")
 
-if uploaded_file is not None:
-    with st.spinner("正在解析檔案並進行智慧分段..."):
-        full_text = extract_text(uploaded_file)
+uploaded_file = st.file_uploader("上傳書籍檔案 (.txt, .pdb, .mobi, .epub, .pdf, .docx)", type=["txt", "pdb", "mobi", "epub", "pdf", "docx"])
+
+if uploaded_file:
+    with st.spinner("正在優化書籍結構與進行智慧斷句..."):
+        raw_text = extract_text(uploaded_file)
+        sentences = split_into_sentences(raw_text)
+
+    st.success(f"書籍載入完成，共解析出 {len(sentences)} 個語音句段！")
+
+    # 為前 50 句生成即時音訊數據（提升預載速度）
+    # 在前端透過 JavaScript 控制連續播放與即時點擊高亮
+    if "audio_cache" not in st.session_state:
+        st.session_state.audio_cache = {}
+
+    voice_code = VOICES[selected_voice]
+
+    # 批次預合成音訊 (非同步極速處理)
+    with st.spinner("⚡ Speechify 引擎正在極速預載語音..."):
+        async def prepare_audios():
+            tasks = [generate_sentence_audio(s, voice_code, speed_percent) for s in sentences[:30]] # 先預載前30句
+            return await asyncio.gather(*tasks)
         
-    if not full_text or "解析失敗" in full_text:
-        st.error("無法提取文字內容，請確認檔案是否毀損或加密。")
-    else:
-        chunks = split_text_into_chunks(full_text)
-        st.success(f"📖 書籍載入成功！已拆分為 {len(chunks)} 個即時朗讀區段。")
+        audio_b64_list = asyncio.run(prepare_audios())
 
-        if "current_idx" not in st.session_state:
-            st.session_state.current_idx = 0
+    # 構建純 HTML/JS Speechify 互動元件
+    sentences_json = []
+    for idx, (s, b64) in enumerate(zip(sentences[:30], audio_b64_list)):
+        sentences_json.append({
+            "id": idx,
+            "text": s,
+            "audio": f"data:audio/mp3;base64,{b64}"
+        })
 
-        # 控制按鈕
-        col1, col2, col3 = st.columns([1, 2, 1])
-        with col1:
-            if st.button("⬅️ 上一段") and st.session_state.current_idx > 0:
-                st.session_state.current_idx -= 1
-                st.rerun()
-        with col3:
-            if st.button("下一段 ➡️") and st.session_state.current_idx < len(chunks) - 1:
-                st.session_state.current_idx += 1
-                st.rerun()
+    # 使用 HTML/JS 渲染 Speechify 控制器與高亮文字
+    import json
+    data_manifest = json.dumps(sentences_json)
 
-        idx = st.session_state.current_idx
-        current_text = chunks[idx]
+    speechify_html = f"""
+    <div class="speechify-container" id="reader-container">
+        <div id="text-body"></div>
+    </div>
 
-        # Speechify 高亮顯示
-        st.markdown(f"**閱讀進度：第 {idx + 1} / {len(chunks)} 段**")
-        st.markdown(
-            f'<div class="highlight-box">💡 <b>當前朗讀：</b><br>{current_text}</div>', 
-            unsafe_allow_html=True
-        )
+    <!-- 底部 Speechify 懸浮控制 Bar -->
+    <div id="speechify-bar" style="
+        position: fixed;
+        bottom: 20px;
+        left: 50%;
+        transform: translateX(-50%);
+        width: 90%;
+        max-width: 650px;
+        background: #1e1e1e;
+        color: white;
+        padding: 12px 25px;
+        border-radius: 40px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        box-shadow: 0 10px 30px rgba(0,0,0,0.3);
+        z-index: 9999;
+    ">
+        <button id="btn-prev" style="background:none;border:none;color:white;font-size:20px;cursor:pointer;">⏮️</button>
+        <button id="btn-play" style="background:#0066cc;border:none;color:white;font-size:22px;padding:8px 20px;border-radius:20px;cursor:pointer;">▶️ 播放</button>
+        <button id="btn-next" style="background:none;border:none;color:white;font-size:20px;cursor:pointer;">⏭️</button>
+        <span id="progress-text" style="font-size:14px;color:#ccc;">1 / {len(sentences_json)}</span>
+    </div>
 
-        # 極速合成
-        with st.spinner("⚡ AI 正在極速合成當前段落語音..."):
-            voice_code = VOICES[selected_voice]
-            audio_bytes = asyncio.run(tts_fast(current_text, voice_code, speed_percent))
+    <audio id="global-audio" style="display:none;"></audio>
+
+    <script>
+        const manifest = {data_manifest};
+        let currentIndex = 0;
+        let isPlaying = false;
+        
+        const textBody = document.getElementById('text-body');
+        const audioPlayer = document.getElementById('global-audio');
+        const playBtn = document.getElementById('btn-play');
+        const prevBtn = document.getElementById('btn-prev');
+        const nextBtn = document.getElementById('btn-next');
+        const progressText = document.getElementById('progress-text');
+
+        // 1. 渲染句子並綁定 Speechify 點擊跳躍事件
+        manifest.forEach((item, index) => {{
+            const span = document.createElement('span');
+            span.className = 'sentence';
+            span.id = 'sentence-' + index;
+            span.innerText = item.text + ' ';
+            span.onclick = () => playSentence(index);
+            textBody.appendChild(span);
+        }});
+
+        // 2. 播放指定句子（高亮 + 自動滾動）
+        function playSentence(index) {{
+            if (index < 0 || index >= manifest.length) return;
             
-            st.audio(audio_bytes, format="audio/mp3", autoplay=True)
+            // 移除舊高亮
+            document.querySelectorAll('.sentence').forEach(el => el.classList.remove('active'));
+            
+            currentIndex = index;
+            const currentItem = manifest[index];
+            const activeSpan = document.getElementById('sentence-' + index);
+            
+            // 加入新高亮
+            activeSpan.classList.add('active');
+            
+            // Speechify 智慧平滑自動捲動
+            activeSpan.scrollIntoView({{ behavior: 'smooth', block: 'center' }});
+            
+            // 載入音訊並播放
+            audioPlayer.src = currentItem.audio;
+            audioPlayer.play();
+            isPlaying = true;
+            playBtn.innerText = '⏸️ 暫停';
+            progressText.innerText = (index + 1) + ' / ' + manifest.length;
+        }}
 
-        with st.expander("📥 想要下載這段的 MP3 檔？"):
-            st.download_button(
-                label="⬇️ 下載當前段落 MP3",
-                data=audio_bytes,
-                file_name=f"section_{idx+1}.mp3",
-                mime="audio/mp3"
-            )
+        // 3. 自動接續下一句 (Speechify 無縫播放)
+        audioPlayer.onended = () => {{
+            if (currentIndex + 1 < manifest.length) {{
+                playSentence(currentIndex + 1);
+            }} else {{
+                isPlaying = false;
+                playBtn.innerText = '▶️ 播放';
+            }}
+        }};
+
+        // 4. 控制 Bar 按鈕事件
+        playBtn.onclick = () => {{
+            if (isPlaying) {{
+                audioPlayer.pause();
+                isPlaying = false;
+                playBtn.innerText = '▶️ 播放';
+            }} else {{
+                if (!audioPlayer.src) {{
+                    playSentence(0);
+                }} else {{
+                    audioPlayer.play();
+                    isPlaying = true;
+                    playBtn.innerText = '⏸️ 暫停';
+                }}
+            }}
+        }};
+
+        prevBtn.onclick = () => playSentence(currentIndex - 1);
+        nextBtn.onclick = () => playSentence(currentIndex + 1);
+    </script>
+    """
+
+    st.components.v1.html(speechify_html, height=700, scrolling=True)
