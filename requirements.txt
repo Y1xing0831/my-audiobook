@@ -4,3 +4,4 @@ pypdf
 EbookLib
 python-docx
 beautifulsoup4
+chardet
