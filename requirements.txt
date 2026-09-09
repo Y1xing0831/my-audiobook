@@ -6,3 +6,4 @@ python-docx
 beautifulsoup4
 chardet
 mobi
+streamlit-javascript
